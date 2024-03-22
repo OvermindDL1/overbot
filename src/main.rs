@@ -1,6 +1,8 @@
 use anyhow::Context;
 use clap::Parser;
 use tokio::sync::broadcast::error::SendError;
+use tokio::task::JoinSet;
+use tracing::info;
 
 mod discord;
 pub mod logging;
@@ -24,45 +26,60 @@ async fn main() -> anyhow::Result<()> {
 	let (exit_tx, mut exit_rx) = tokio::sync::broadcast::channel::<()>(1);
 	let exit_tx = ShutdownTrigger(exit_tx);
 
+	let mut set = JoinSet::<anyhow::Result<&'static str>>::new();
+
 	let web_exit_tx = exit_tx.clone();
-	let mut web_server = tokio::spawn(async move {
+	set.spawn(async move {
 		web_server::launch_server(web_exit_tx.receiver(), web_exit_tx)
 			.await
-			.context("web server error")
+			.context("web server error")?;
+		Ok("web server")
 	});
 
 	let discord_exit_tx = exit_tx.clone();
-	let mut discord_server = tokio::spawn(async move {
+	set.spawn(async move {
 		args.discord_args
-			.discord_connection( discord_exit_tx)
+			.discord_connection(discord_exit_tx)
 			.await
-			.context("discord server error")
+			.context("discord server error")?;
+		Ok("discord server")
 	});
 
-	// We don't care about waiting on this to die, it's a background task
-	let sig_exit_tx = exit_tx.clone();
-	let _signal_handler = tokio::spawn(async move {
-		tokio::signal::ctrl_c().await.expect("ctrl-c signal error");
-		sig_exit_tx.shutdown().expect("shutdown trigger had an error");
+	let mut waiter_exit_rx = exit_tx.receiver();
+	set.spawn(async move {
+		waiter_exit_rx.recv().await.context("exit receiver join error")?;
+		Ok("exit signal waiter")
 	});
 
-	// If any of these die, shutdown.
-	tokio::select! {
-		_ = exit_rx.recv() => {
-			// Normal shutdown requested, wait on everything to shut down
-			Ok(())
+	let ctrlc_exit_tx = exit_tx.clone();
+	set.spawn(async move {
+		let mut ctrlc_exit_rx = ctrlc_exit_tx.receiver();
+		tokio::select! {
+			_ = ctrlc_exit_rx.recv() => {
+				// Normal shutdown requested, wait on everything to shut down
+				Ok("ctrl-c: exit signal")
+			}
+			_ = tokio::signal::ctrl_c() => {
+				info!("ctrl-c signal received, sending shutdown signal");
+				ctrlc_exit_tx.shutdown().context("shutdown trigger had an error")?;
+				Ok("ctrl-c: ctrl-c signal")
+			}
 		}
-		result = &mut web_server => {
-			// Web server died, shut down
+	});
+
+	let mut sent = false;
+	while let Some(res) = set.join_next().await {
+		info!(?res, "main task joined");
+		if !sent && exit_rx.try_recv().is_err() {
 			exit_tx.shutdown().expect("shutdown trigger had an error");
-			result.context("join web server error").and_then(|r| r.context("web server error"))
 		}
-		result = &mut discord_server => {
-			// Discord server died, shut down
-			exit_tx.shutdown().expect("shutdown trigger had an error");
-			result.context("join discord server error").and_then(|r| r.context("discord server error"))
+		sent = true;
+		if let Err(error) = res {
+			info!(?error, "error in task");
 		}
-	}?;
+	}
+
+	info!("shut down complete");
 
 	Ok(())
 }
@@ -72,6 +89,7 @@ pub struct ShutdownTrigger(tokio::sync::broadcast::Sender<()>);
 
 impl ShutdownTrigger {
 	pub fn shutdown(&self) -> Result<usize, SendError<()>> {
+		info!("sending shutdown signal");
 		self.0.send(())
 	}
 

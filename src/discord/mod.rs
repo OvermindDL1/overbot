@@ -4,15 +4,10 @@ use crate::discord::shards::Shards;
 use crate::ShutdownTrigger;
 use anyhow::Context;
 use clap::Parser;
-use cryptex::DynKeyRing;
+
 use std::fmt::{Debug, Formatter};
 use std::io::Read;
-use tokio::sync::broadcast::Receiver;
-use tokio::task::JoinSet;
 use tracing::{debug, error, info, instrument};
-use twilight_cache_inmemory::DefaultInMemoryCache;
-use twilight_gateway::{EventTypeFlags, StreamExt};
-use twilight_model::gateway::Intents;
 
 #[derive(Parser, Clone)]
 pub struct DiscordArgs {
@@ -42,6 +37,7 @@ impl DiscordArgs {
 			// TODO: This is untested and doesn't seem to work on a get without a set first for some reason
 			#[cfg(feature = "keyring")]
 			{
+				use cryptex::DynKeyRing;
 				let mut keyring = cryptex::get_os_keyring("overbot")?;
 				// keyring.set_secret("overbot-discord-token", b"test")?;
 				if let Ok(token) = keyring
